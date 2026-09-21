@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON ACUSES NATIVOS Y TRADUCCIÓN BIDIRECCIONAL)
+// 3. CLASE WHATSAPP ON-DEMAND (MAPEO EXACTO DE ESTADOS DE BAILEYS)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -207,23 +207,23 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 2. Listener de Acuses de Recibo (Plecas mediante messages.update)
+    // 2. Listener de Actualización de Mensajes (Status numérico)
     this.socket.ev.on('messages.update', async (updates) => {
       const supabase = getSupabase();
       if (!supabase) return;
 
       for (const update of updates) {
-        if (update.key && update.update && update.update.status) {
+        if (update.key && update.key.fromMe && update.update && typeof update.update.status === 'number') {
           const externalId = update.key.id;
-          const newStatusNumber = update.update.status;
+          const statusNum = update.update.status;
 
-          const statusNum = Number(newStatusNumber);
-          let statusText = 'sent';
-          if (statusNum === 4) statusText = 'sent';
-          if (statusNum === 5) statusText = 'delivered';
-          if (statusNum >= 6) statusText = 'read';
+          let statusText: string | null = null;
+          // Mapeo actual de Baileys: 2=SERVER_ACK, 3=DELIVERY_ACK, 4=READ, 5=PLAYED
+          if (statusNum === 2) statusText = 'sent';
+          if (statusNum === 3) statusText = 'delivered';
+          if (statusNum === 4 || statusNum === 5) statusText = 'read';
 
-          if (externalId && ['sent', 'delivered', 'read'].includes(statusText)) {
+          if (externalId && statusText) {
             try {
               await supabase
                 .from('wa_messages')
@@ -237,20 +237,18 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 3. Listener de Recibos Nativos de WhatsApp (message-receipt.update)
+    // 3. Listener de Acuses de Recibo Nativos
     this.socket.ev.on('message-receipt.update', async (updates) => {
       const supabase = getSupabase();
       if (!supabase) return;
 
       for (const receipt of updates) {
-        if (receipt.key && receipt.key.id) {
+        if (receipt.key && receipt.key.id && receipt.key.fromMe) {
           const externalId = receipt.key.id;
+          const type = (receipt.receipt as any)?.receiptType;
 
-          let statusText = 'delivered';
-
-          const receiptObj = receipt.receipt as any;
-          const type = receiptObj?.receiptType;
-          if (type === 'read' || type === 'read-self' || receiptObj?.readTimestamp) {
+          let statusText = 'delivered'; // Asumimos entregado por defecto si llega recibo
+          if (type === 'read' || type === 'read-self' || type === 'played') {
             statusText = 'read';
           }
 
