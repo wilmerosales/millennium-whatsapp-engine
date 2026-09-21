@@ -57,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (ANTI-SOCKETS FANTASMAS Y RECONEXIÓN SILENCIOSA)
+// 3. CLASE WHATSAPP ON-DEMAND (CON SOPORTE NATIVO PARA JID / LID)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -80,7 +80,7 @@ class WhatsAppOnDemandService {
       return { qrCodeDataUrl: null, state: 'connected' };
     }
 
-    // 1. Limpieza preventiva: destruir socket previo y sus listeners para evitar sockets fantasmas
+    // Limpieza preventiva de sockets fantasmas antes de reinicializar
     if (this.socket) {
       try {
         this.socket.ev.removeAllListeners('connection.update');
@@ -151,14 +151,13 @@ class WhatsAppOnDemandService {
           console.log(`[WhatsApp On-Demand] Conectado exitosamente con: ${this.connectedPhone}`);
         }
 
-        // 2. Auto-Reconexión Silenciosa sin expulsar al usuario
+        // Auto-Reconexión Silenciosa sin expulsar al usuario
         if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
           if (shouldReconnect) {
             console.log('[WhatsApp] Micro-corte detectado. Reconectando silenciosamente...');
-            // No cambiamos this.connectionState a 'disconnected' para no colapsar la UI
             this.startSession();
           } else {
             console.log('[WhatsApp] Sesión cerrada permanentemente o desvinculada.');
@@ -193,13 +192,13 @@ class WhatsAppOnDemandService {
     return { qrCodeDataUrl: this.qrCodeDataUrl, state: this.connectionState };
   }
 
+  // Entrega respetando el dominio si viene de la base de datos (LID o s.whatsapp.net)
   public async sendMessage(toPhone: string, text: string) {
     if (!this.socket || this.connectionState !== 'connected') {
       throw new Error('No hay una sesión activa de WhatsApp');
     }
 
-    const cleanPhone = toPhone.replace(/[^\d]/g, '');
-    const jid = `${cleanPhone}@s.whatsapp.net`;
+    const jid = toPhone.includes('@') ? toPhone : `${toPhone.replace(/[^\d]/g, '')}@s.whatsapp.net`;
 
     const sent = await this.socket.sendMessage(jid, { text });
     return sent;
@@ -213,7 +212,7 @@ class WhatsAppOnDemandService {
         this.socket = null;
       }
     } catch {
-      // Socket ya cerrado
+      // Ignorar si el socket ya estaba cerrado
     }
     this.connectionState = 'disconnected';
     this.qrCodeDataUrl = null;
@@ -222,12 +221,17 @@ class WhatsAppOnDemandService {
     return { success: true };
   }
 
+  // Persistencia conservando el dominio JID/LID completo
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
     const isOutbound = Boolean(msg.key.fromMe);
     const remoteJid = msg.key.remoteJid || '';
-    const rawPhone = remoteJid.replace('@s.whatsapp.net', '').replace(/[^\d]/g, '');
+
+    let rawPhone = remoteJid;
+    if (rawPhone.includes(':')) {
+      rawPhone = rawPhone.split(':')[0] + rawPhone.substring(rawPhone.indexOf('@'));
+    }
 
     if (!rawPhone) return;
 
@@ -238,7 +242,7 @@ class WhatsAppOnDemandService {
       msg.message.videoMessage?.caption ||
       '[Multimedia / Archivo adjunto]';
 
-    const pushName = msg.pushName || `+${rawPhone}`;
+    const pushName = msg.pushName || `+${rawPhone.split('@')[0]}`;
     const timestamp = msg.messageTimestamp
       ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
       : new Date().toISOString();
@@ -284,7 +288,7 @@ class WhatsAppOnDemandService {
       if (msgError) {
         console.error('❌ Error de Supabase (Mensaje):', msgError);
       } else {
-        console.log(`✅ Mensaje guardado en Supabase para +${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
+        console.log(`✅ Mensaje guardado en Supabase para ${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
       }
     } catch (err) {
       console.error('❌ Error de Supabase (Excepción):', err);
