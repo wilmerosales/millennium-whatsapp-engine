@@ -15,7 +15,7 @@ import fs from 'fs';
 import pino from 'pino';
 
 // ============================================================================
-// 1. MANEJO GLOBAL DE ERRORES (PREVENIR CIERRE ABRUPTO DEL PROCESO)
+// 1. MANEJO GLOBAL DE ERRORES
 // ============================================================================
 process.on('uncaughtException', (err) => {
   console.error('[CRITICAL - Uncaught Exception]:', err?.message || err);
@@ -57,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON SOPORTE NATIVO PARA JID / LID)
+// 3. CLASE WHATSAPP ON-DEMAND (PROTECCIÓN DE NOMBRES EN LIBRETA)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -151,7 +151,7 @@ class WhatsAppOnDemandService {
           console.log(`[WhatsApp On-Demand] Conectado exitosamente con: ${this.connectedPhone}`);
         }
 
-        // Auto-Reconexión Silenciosa sin expulsar al usuario
+        // Auto-reconexión silenciosa
         if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -192,14 +192,12 @@ class WhatsAppOnDemandService {
     return { qrCodeDataUrl: this.qrCodeDataUrl, state: this.connectionState };
   }
 
-  // Entrega respetando el dominio si viene de la base de datos (LID o s.whatsapp.net)
   public async sendMessage(toPhone: string, text: string) {
     if (!this.socket || this.connectionState !== 'connected') {
       throw new Error('No hay una sesión activa de WhatsApp');
     }
 
     const jid = toPhone.includes('@') ? toPhone : `${toPhone.replace(/[^\d]/g, '')}@s.whatsapp.net`;
-
     const sent = await this.socket.sendMessage(jid, { text });
     return sent;
   }
@@ -221,7 +219,7 @@ class WhatsAppOnDemandService {
     return { success: true };
   }
 
-  // Persistencia conservando el dominio JID/LID completo
+  // Persistencia condicional: no sobrescribe nombres modificados por el usuario
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
@@ -254,29 +252,41 @@ class WhatsAppOnDemandService {
         return;
       }
 
-      // 1. Upsert del contacto
-      const { data: contactData, error: contactError } = await supabase
+      // 1. Verificar si el contacto ya existe para proteger nombres editados
+      const { data: existingContact } = await supabase
         .from('wa_contacts')
-        .upsert(
-          {
-            phone: rawPhone,
-            name: pushName,
-            last_message_at: timestamp
-          },
-          { onConflict: 'phone' }
-        )
-        .select('id')
+        .select('id, name')
+        .eq('phone', rawPhone)
         .single();
 
-      if (contactError || !contactData?.id) {
-        console.error('❌ Error de Supabase (Contacto):', contactError || 'No se obtuvo ID');
-        return;
+      let contactId: string;
+
+      if (existingContact) {
+        contactId = existingContact.id;
+        // Solo actualiza la fecha, protege el nombre existente
+        await supabase
+          .from('wa_contacts')
+          .update({ last_message_at: timestamp })
+          .eq('id', contactId);
+      } else {
+        // Inserta el nuevo contacto con el pushName inicial
+        const { data: newContact, error: insertError } = await supabase
+          .from('wa_contacts')
+          .insert([{ phone: rawPhone, name: pushName, last_message_at: timestamp }])
+          .select('id')
+          .single();
+
+        if (insertError || !newContact) {
+          console.error('❌ Error insertando contacto:', insertError);
+          return;
+        }
+        contactId = newContact.id;
       }
 
-      // 2. Inserción del mensaje
+      // 2. Inserción del mensaje usando el contactId seguro
       const { error: msgError } = await supabase.from('wa_messages').insert([
         {
-          contact_id: contactData.id,
+          contact_id: contactId,
           message_body: textBody,
           direction: isOutbound ? 'outbound' : 'inbound',
           timestamp: timestamp,
@@ -286,7 +296,7 @@ class WhatsAppOnDemandService {
       ]);
 
       if (msgError) {
-        console.error('❌ Error de Supabase (Mensaje):', msgError);
+        console.error('❌ Error guardando mensaje en Supabase:', msgError);
       } else {
         console.log(`✅ Mensaje guardado en Supabase para ${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
       }
