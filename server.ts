@@ -57,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (PROTECCIÓN DE NOMBRES EN LIBRETA)
+// 3. CLASE WHATSAPP ON-DEMAND (CON FILTRO DE AUTO-REGISTRO Y PAQUETES META)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -80,7 +80,7 @@ class WhatsAppOnDemandService {
       return { qrCodeDataUrl: null, state: 'connected' };
     }
 
-    // Limpieza preventiva de sockets fantasmas antes de reinicializar
+    // Limpieza preventiva de sockets previos
     if (this.socket) {
       try {
         this.socket.ev.removeAllListeners('connection.update');
@@ -151,7 +151,7 @@ class WhatsAppOnDemandService {
           console.log(`[WhatsApp On-Demand] Conectado exitosamente con: ${this.connectedPhone}`);
         }
 
-        // Auto-reconexión silenciosa
+        // Auto-reconexión silenciosa en micro-cortes
         if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -210,7 +210,7 @@ class WhatsAppOnDemandService {
         this.socket = null;
       }
     } catch {
-      // Ignorar si el socket ya estaba cerrado
+      // Ignorar si ya estaba cerrado
     }
     this.connectionState = 'disconnected';
     this.qrCodeDataUrl = null;
@@ -219,7 +219,6 @@ class WhatsAppOnDemandService {
     return { success: true };
   }
 
-  // Persistencia condicional: no sobrescribe nombres modificados por el usuario
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
@@ -233,6 +232,16 @@ class WhatsAppOnDemandService {
 
     if (!rawPhone) return;
 
+    // Obtener el número administrador de la sesión activa
+    const myPhone = this.socket?.user?.id?.split(':')[0] || '';
+
+    // Ignorar si el registro corresponde al propio número (evita auto-registro)
+    if (rawPhone === myPhone || rawPhone.split('@')[0] === myPhone) return;
+
+    // Ignorar paquetes de sincronización técnica y estado interno de Meta
+    if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) return;
+
+    // Extraer texto del mensaje
     const textBody =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -252,7 +261,7 @@ class WhatsAppOnDemandService {
         return;
       }
 
-      // 1. Verificar si el contacto ya existe para proteger nombres editados
+      // 1. Verificar si el contacto ya existe para proteger nombres editados por el usuario
       const { data: existingContact } = await supabase
         .from('wa_contacts')
         .select('id, name')
@@ -283,7 +292,7 @@ class WhatsAppOnDemandService {
         contactId = newContact.id;
       }
 
-      // 2. Inserción del mensaje usando el contactId seguro
+      // 2. Inserción del mensaje usando el contactId protegido
       const { error: msgError } = await supabase.from('wa_messages').insert([
         {
           contact_id: contactId,
