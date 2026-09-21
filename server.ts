@@ -7,7 +7,6 @@ import makeWASocket, {
   useMultiFileAuthState,
   WASocket,
   proto,
-  fetchLatestBaileVersion,
   fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
@@ -58,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON MODO DETECTIVE PARA LIDs)
+// 3. CLASE WHATSAPP ON-DEMAND (EXTRACCIÓN DEFINITIVA SENDER_PN)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -221,19 +220,6 @@ class WhatsAppOnDemandService {
   }
 
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
-    // ---------------------------------------------------------
-    // MODO DETECTIVE: RASTREO PROFUNDO DE LIDs
-    // ---------------------------------------------------------
-    if (
-      msg.key.remoteJid?.includes('@lid') ||
-      msg.key.participant?.includes('@lid') ||
-      (msg as any).participant?.includes('@lid')
-    ) {
-      console.log('\n🔍 --- MENSAJE @LID DETECTADO --- 🔍');
-      console.dir(msg, { depth: null, colors: true });
-      console.log('------------------------------------\n');
-    }
-
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
     const isOutbound = Boolean(msg.key.fromMe);
@@ -241,11 +227,13 @@ class WhatsAppOnDemandService {
     // 1. Obtener el JID inicial
     let rawPhone = msg.key.remoteJid || '';
 
-    // 2. Si Meta ocultó el número usando un @lid, extraemos el número real desde participant
+    // 2. Si Meta ocultó el número usando un @lid, extraemos el número real desde senderPn
     if (rawPhone.includes('@lid')) {
-      const altJid = msg.key.participant || (msg as any).participant || '';
-      if (altJid.includes('@s.whatsapp.net')) {
-        rawPhone = altJid;
+      // @ts-ignore - Baileys a veces no tipa senderPn en versiones antiguas
+      const realPhone = (msg.key as any).senderPn;
+      if (realPhone && realPhone.includes('@s.whatsapp.net')) {
+        rawPhone = realPhone;
+        console.log(`[WhatsApp] LID desenmascarado. Número real: ${rawPhone}`);
       }
     }
 
@@ -254,13 +242,16 @@ class WhatsAppOnDemandService {
       rawPhone = rawPhone.split(':')[0] + rawPhone.substring(rawPhone.indexOf('@'));
     }
 
+    // Limpiar para la base de datos (número puro en dígitos)
+    rawPhone = rawPhone.replace('@s.whatsapp.net', '').replace(/[^\d]/g, '');
+
     if (!rawPhone) return;
 
     // Obtener el número administrador de la sesión activa
-    const myPhone = this.socket?.user?.id?.split(':')[0] || '';
+    const myPhone = (this.socket?.user?.id?.split(':')[0] || '').replace(/[^\d]/g, '');
 
     // Ignorar si el registro corresponde al propio número (evita auto-registro)
-    if (rawPhone === myPhone || rawPhone.split('@')[0] === myPhone) return;
+    if (rawPhone === myPhone) return;
 
     // Ignorar paquetes de sincronización técnica y estado interno de Meta
     if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) return;
@@ -273,7 +264,7 @@ class WhatsAppOnDemandService {
       msg.message.videoMessage?.caption ||
       '[Multimedia / Archivo adjunto]';
 
-    const pushName = msg.pushName || `+${rawPhone.split('@')[0]}`;
+    const pushName = msg.pushName || `+${rawPhone}`;
     const timestamp = msg.messageTimestamp
       ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
       : new Date().toISOString();
@@ -331,7 +322,7 @@ class WhatsAppOnDemandService {
       if (msgError) {
         console.error('❌ Error guardando mensaje en Supabase:', msgError);
       } else {
-        console.log(`✅ Mensaje guardado en Supabase para ${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
+        console.log(`✅ Mensaje guardado en Supabase para +${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
       }
     } catch (err) {
       console.error('❌ Error de Supabase (Excepción):', err);
