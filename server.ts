@@ -7,6 +7,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   WASocket,
   proto,
+  fetchLatestBaileVersion,
   fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
@@ -57,7 +58,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON RESOLUCIÓN DE LIDs A NÚMEROS REALES)
+// 3. CLASE WHATSAPP ON-DEMAND (CON MODO DETECTIVE PARA LIDs)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -220,10 +221,23 @@ class WhatsAppOnDemandService {
   }
 
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
+    // ---------------------------------------------------------
+    // MODO DETECTIVE: RASTREO PROFUNDO DE LIDs
+    // ---------------------------------------------------------
+    if (
+      msg.key.remoteJid?.includes('@lid') ||
+      msg.key.participant?.includes('@lid') ||
+      (msg as any).participant?.includes('@lid')
+    ) {
+      console.log('\n🔍 --- MENSAJE @LID DETECTADO --- 🔍');
+      console.dir(msg, { depth: null, colors: true });
+      console.log('------------------------------------\n');
+    }
+
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
     const isOutbound = Boolean(msg.key.fromMe);
-    
+
     // 1. Obtener el JID inicial
     let rawPhone = msg.key.remoteJid || '';
 
