@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON RASTREADORES DE PAYLOAD EN TIEMPO REAL)
+// 3. CLASE WHATSAPP ON-DEMAND (UPDATE DIRECTO Y SIN BLOQUEOS)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -207,15 +207,8 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 2. Listener de Actualización de Mensajes (Soporta números y strings)
+    // 2. Listener de Actualización de Mensajes (Sin bloqueos)
     this.socket.ev.on('messages.update', async (updates) => {
-      // RASTREADOR
-      const fromMeUpdates = updates.filter((u) => u.key?.fromMe);
-      if (fromMeUpdates.length > 0) {
-        console.log('\n🔄 --- UPDATE DE ESTADO DETECTADO --- 🔄');
-        console.dir(fromMeUpdates, { depth: null, colors: true });
-      }
-
       const supabase = getSupabase();
       if (!supabase) return;
 
@@ -230,30 +223,16 @@ class WhatsAppOnDemandService {
           if (statusVal === 4 || statusVal === 'READ' || statusVal === 5 || statusVal === 'PLAYED') statusText = 'read';
 
           if (externalId && statusText) {
-            try {
-              // Jerarquía: No permitir que un estado retroceda
-              const { data } = await supabase.from('wa_messages').select('status').eq('external_id', externalId).single();
-              const currentStatus = data?.status;
-
-              if (currentStatus === 'read') continue;
-              if (currentStatus === 'delivered' && statusText === 'sent') continue;
-
-              await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
-            } catch (e) {}
+            // Update directo: actualiza todos los registros que coincidan con el ID
+            const { error } = await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
+            if (error) console.error(`❌ Error actualizando a ${statusText}:`, error);
           }
         }
       }
     });
 
-    // 3. Listener de Acuses de Recibo Nativos (Ignorando ruido multidispositivo)
+    // 3. Listener de Acuses de Recibo Nativos
     this.socket.ev.on('message-receipt.update', async (updates) => {
-      // RASTREADOR
-      const fromMeReceipts = updates.filter((r) => r.key?.fromMe);
-      if (fromMeReceipts.length > 0) {
-        console.log('\n📦 --- RECIBO DETECTADO --- 📦');
-        console.dir(fromMeReceipts, { depth: null, colors: true });
-      }
-
       const supabase = getSupabase();
       if (!supabase) return;
 
@@ -262,7 +241,6 @@ class WhatsAppOnDemandService {
           const externalId = receipt.key.id;
           const type = (receipt.receipt as any)?.receiptType;
 
-          // Ignorar los recibos internos entre tus propios dispositivos vinculados
           if (type === 'sender') continue;
 
           let statusText = 'delivered';
@@ -270,13 +248,8 @@ class WhatsAppOnDemandService {
             statusText = 'read';
           }
 
-          try {
-            // Jerarquía: Si ya estaba leído, no lo volvemos a poner como entregado
-            const { data } = await supabase.from('wa_messages').select('status').eq('external_id', externalId).single();
-            if (data?.status === 'read') continue;
-
-            await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
-          } catch (e) {}
+          const { error } = await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
+          if (error) console.error(`❌ Error recibo ${statusText}:`, error);
         }
       }
     });
