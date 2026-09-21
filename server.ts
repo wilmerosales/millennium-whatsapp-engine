@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (TRADUCCIÓN BIDIRECCIONAL DE LIDs)
+// 3. CLASE WHATSAPP ON-DEMAND (CON ACUSES DE RECIBO Y PLECAS EN TIEMPO REAL)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -101,6 +101,7 @@ class WhatsAppOnDemandService {
         this.socket.ev.removeAllListeners('connection.update');
         this.socket.ev.removeAllListeners('creds.update');
         this.socket.ev.removeAllListeners('messages.upsert');
+        this.socket.ev.removeAllListeners('messages.update');
         this.socket.end(undefined);
       } catch (cleanErr) {
         console.warn('[WhatsApp] Advertencia al destruir socket previo:', cleanErr);
@@ -193,6 +194,7 @@ class WhatsAppOnDemandService {
       }
     });
 
+    // 1. Listener de mensajes entrantes y salientes
     this.socket.ev.on('messages.upsert', async ({ messages, type }) => {
       for (const msg of messages) {
         console.log('📬 Mensaje detectado de:', msg.key.remoteJid, 'Tipo:', type);
@@ -200,6 +202,38 @@ class WhatsAppOnDemandService {
           await this.persistMessageToSupabase(msg);
         } catch (msgErr) {
           console.error('[WhatsApp On-Demand] Error procesando mensaje:', msgErr);
+        }
+      }
+    });
+
+    // 2. Listener de Acuses de Recibo (Plecas de entrega / lectura)
+    this.socket.ev.on('messages.update', async (updates) => {
+      const supabase = getSupabase();
+      if (!supabase) return;
+
+      for (const update of updates) {
+        if (update.key && update.update && update.update.status) {
+          const externalId = update.key.id;
+          const newStatusNumber = update.update.status;
+
+          // Mapeo interno de Baileys a texto:
+          // 4 = SERVER_ACK (Enviado - 1 pleca), 5 = DELIVERY_ACK (Entregado - 2 plecas), 6 = READ (Leído - 2 azules)
+          const statusNum = Number(newStatusNumber);
+          let statusText = 'sent';
+          if (statusNum === 4) statusText = 'sent';
+          if (statusNum === 5) statusText = 'delivered';
+          if (statusNum >= 6) statusText = 'read';
+
+          if (externalId && ['sent', 'delivered', 'read'].includes(statusText)) {
+            try {
+              await supabase
+                .from('wa_messages')
+                .update({ status: statusText })
+                .eq('external_id', externalId);
+            } catch (e) {
+              console.error('[WhatsApp] Error actualizando estado de mensaje:', e);
+            }
+          }
         }
       }
     });
