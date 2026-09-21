@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (TRADUCCIÓN INVERSA Y BLOQUEO DE HUÉRFANOS)
+// 3. CLASE WHATSAPP ON-DEMAND (CON ACUSES NATIVOS Y TRADUCCIÓN BIDIRECCIONAL)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -102,6 +102,7 @@ class WhatsAppOnDemandService {
         this.socket.ev.removeAllListeners('creds.update');
         this.socket.ev.removeAllListeners('messages.upsert');
         this.socket.ev.removeAllListeners('messages.update');
+        this.socket.ev.removeAllListeners('message-receipt.update');
         this.socket.end(undefined);
       } catch (cleanErr) {
         console.warn('[WhatsApp] Advertencia al destruir socket previo:', cleanErr);
@@ -206,7 +207,7 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 2. Listener de Acuses de Recibo (Plecas)
+    // 2. Listener de Acuses de Recibo (Plecas mediante messages.update)
     this.socket.ev.on('messages.update', async (updates) => {
       const supabase = getSupabase();
       if (!supabase) return;
@@ -231,6 +232,35 @@ class WhatsAppOnDemandService {
             } catch (e) {
               console.error('[WhatsApp] Error actualizando estado de mensaje:', e);
             }
+          }
+        }
+      }
+    });
+
+    // 3. Listener de Recibos Nativos de WhatsApp (message-receipt.update)
+    this.socket.ev.on('message-receipt.update', async (updates) => {
+      const supabase = getSupabase();
+      if (!supabase) return;
+
+      for (const receipt of updates) {
+        if (receipt.key && receipt.key.id) {
+          const externalId = receipt.key.id;
+
+          let statusText = 'delivered';
+
+          const receiptObj = receipt.receipt as any;
+          const type = receiptObj?.receiptType;
+          if (type === 'read' || type === 'read-self' || receiptObj?.readTimestamp) {
+            statusText = 'read';
+          }
+
+          try {
+            await supabase
+              .from('wa_messages')
+              .update({ status: statusText })
+              .eq('external_id', externalId);
+          } catch (e) {
+            console.error('[WhatsApp] Error en message-receipt.update:', e);
           }
         }
       }
@@ -305,9 +335,8 @@ class WhatsAppOnDemandService {
       const realPhone = (msg.key as any).senderPn;
 
       if (realPhone && realPhone.includes('@s.whatsapp.net')) {
-        finalPhone = realPhone.replace(/[^\d]/g, ''); // Entrante: Trae el número real
+        finalPhone = realPhone.replace(/[^\d]/g, '');
       } else {
-        // Saliente/Acuse: Buscar el dueño del LID en la BD
         try {
           const { data } = await supabase.from('wa_contacts').select('phone').eq('lid', lidToSave).single();
           if (data && data.phone) finalPhone = data.phone;
@@ -341,7 +370,6 @@ class WhatsAppOnDemandService {
 
       if (existingContact) {
         contactId = existingContact.id;
-        // Solo inyectamos el LID si existe, sin borrarlo si ya estaba
         const updateData: any = { last_message_at: timestamp };
         if (lidToSave) updateData.lid = lidToSave;
         await supabase.from('wa_contacts').update(updateData).eq('id', contactId);
