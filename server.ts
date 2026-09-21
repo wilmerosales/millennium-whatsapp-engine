@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (ROBUSTEZ EN ACUSES Y PREVENCIÓN DE RETROCESOS)
+// 3. CLASE WHATSAPP ON-DEMAND (CON RASTREADORES DE PAYLOAD EN TIEMPO REAL)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -209,6 +209,13 @@ class WhatsAppOnDemandService {
 
     // 2. Listener de Actualización de Mensajes (Soporta números y strings)
     this.socket.ev.on('messages.update', async (updates) => {
+      // RASTREADOR
+      const fromMeUpdates = updates.filter((u) => u.key?.fromMe);
+      if (fromMeUpdates.length > 0) {
+        console.log('\n🔄 --- UPDATE DE ESTADO DETECTADO --- 🔄');
+        console.dir(fromMeUpdates, { depth: null, colors: true });
+      }
+
       const supabase = getSupabase();
       if (!supabase) return;
 
@@ -240,6 +247,13 @@ class WhatsAppOnDemandService {
 
     // 3. Listener de Acuses de Recibo Nativos (Ignorando ruido multidispositivo)
     this.socket.ev.on('message-receipt.update', async (updates) => {
+      // RASTREADOR
+      const fromMeReceipts = updates.filter((r) => r.key?.fromMe);
+      if (fromMeReceipts.length > 0) {
+        console.log('\n📦 --- RECIBO DETECTADO --- 📦');
+        console.dir(fromMeReceipts, { depth: null, colors: true });
+      }
+
       const supabase = getSupabase();
       if (!supabase) return;
 
