@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON ACUSES DE RECIBO Y PLECAS EN TIEMPO REAL)
+// 3. CLASE WHATSAPP ON-DEMAND (TRADUCCIÓN INVERSA Y BLOQUEO DE HUÉRFANOS)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -206,7 +206,7 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 2. Listener de Acuses de Recibo (Plecas de entrega / lectura)
+    // 2. Listener de Acuses de Recibo (Plecas)
     this.socket.ev.on('messages.update', async (updates) => {
       const supabase = getSupabase();
       if (!supabase) return;
@@ -216,8 +216,6 @@ class WhatsAppOnDemandService {
           const externalId = update.key.id;
           const newStatusNumber = update.update.status;
 
-          // Mapeo interno de Baileys a texto:
-          // 4 = SERVER_ACK (Enviado - 1 pleca), 5 = DELIVERY_ACK (Entregado - 2 plecas), 6 = READ (Leído - 2 azules)
           const statusNum = Number(newStatusNumber);
           let statusText = 'sent';
           if (statusNum === 4) statusText = 'sent';
@@ -241,7 +239,7 @@ class WhatsAppOnDemandService {
     return { qrCodeDataUrl: this.qrCodeDataUrl, state: this.connectionState };
   }
 
-  // Traducción de salida: si el contacto se registró con LID, envía usando dicho LID
+  // Envía un mensaje y busca el LID si existe
   public async sendMessage(toPhone: string, text: string) {
     if (!this.socket || this.connectionState !== 'connected') {
       throw new Error('No hay una sesión activa de WhatsApp');
@@ -250,18 +248,15 @@ class WhatsAppOnDemandService {
     const cleanPhone = toPhone.replace(/[^\d]/g, '');
     let targetJid = `${cleanPhone}@s.whatsapp.net`;
 
-    const supabase = getSupabase();
-    if (supabase) {
-      try {
+    try {
+      const supabase = getSupabase();
+      if (supabase) {
         const { data } = await supabase.from('wa_contacts').select('lid').eq('phone', cleanPhone).single();
-        if (data && (data as any).lid) {
-          targetJid = (data as any).lid;
-          console.log(`[WhatsApp] Traduciendo salida a LID: ${targetJid}`);
+        if (data && data.lid) {
+          targetJid = data.lid;
         }
-      } catch (lidErr) {
-        console.warn('[WhatsApp] Advertencia al consultar LID para envío:', lidErr);
       }
-    }
+    } catch (e) {}
 
     const sent = await this.socket.sendMessage(targetJid, { text });
     return sent;
@@ -284,46 +279,50 @@ class WhatsAppOnDemandService {
     return { success: true };
   }
 
+  // Guarda en BD con traducción inversa y bloqueo de huérfanos
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
     const isOutbound = Boolean(msg.key.fromMe);
+    const remoteJid = msg.key.remoteJid || '';
 
-    // 1. Obtener el JID inicial
-    let rawPhone = msg.key.remoteJid || '';
+    // Bloqueo de sistema y sincronización
+    const myPhone = this.socket?.user?.id?.split(':')[0] || '';
+    let rawPhone = remoteJid;
+    if (rawPhone.includes(':')) rawPhone = rawPhone.split(':')[0] + rawPhone.substring(rawPhone.indexOf('@'));
+    const rawPhoneNum = rawPhone.replace(/[^\d]/g, '');
+    if (rawPhoneNum === myPhone || msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) return;
+
+    const supabase = getSupabase();
+    if (!supabase) return;
+
     let lidToSave: string | null = null;
+    let finalPhone = rawPhoneNum;
 
-    // 2. Si Meta ocultó el número usando un @lid, extraemos el número real desde senderPn y guardamos el LID
-    if (rawPhone.includes('@lid')) {
-      lidToSave = rawPhone;
-      // @ts-ignore - Baileys a veces no tipa senderPn en versiones antiguas
+    // Lógica de Traducción Bidireccional LID -> Teléfono
+    if (remoteJid.includes('@lid')) {
+      lidToSave = remoteJid;
       const realPhone = (msg.key as any).senderPn;
+
       if (realPhone && realPhone.includes('@s.whatsapp.net')) {
-        rawPhone = realPhone;
-        console.log(`[WhatsApp] LID desenmascarado. Número real: ${rawPhone}`);
+        finalPhone = realPhone.replace(/[^\d]/g, ''); // Entrante: Trae el número real
+      } else {
+        // Saliente/Acuse: Buscar el dueño del LID en la BD
+        try {
+          const { data } = await supabase.from('wa_contacts').select('phone').eq('lid', lidToSave).single();
+          if (data && data.phone) finalPhone = data.phone;
+        } catch (e) {}
       }
+    } else {
+      finalPhone = remoteJid.replace('@s.whatsapp.net', '').replace(/[^\d]/g, '');
     }
 
-    // 3. Limpiar el puerto de sesión del dispositivo si existe (ej. 504XXXX:2@s.whatsapp.net -> 504XXXX@s.whatsapp.net)
-    if (rawPhone.includes(':')) {
-      rawPhone = rawPhone.split(':')[0] + rawPhone.substring(rawPhone.indexOf('@'));
+    // SEGURO DE VIDA: Si finalPhone sigue siendo un LID falso, abortamos para no crear chats huérfanos
+    if (finalPhone.startsWith('69') && finalPhone.length > 12) {
+      console.warn(`[WhatsApp] Ignorando mensaje huérfano sin mapeo para el LID: ${lidToSave}`);
+      return;
     }
 
-    // Limpiar para la base de datos (número puro en dígitos)
-    rawPhone = rawPhone.replace('@s.whatsapp.net', '').replace(/[^\d]/g, '');
-
-    if (!rawPhone) return;
-
-    // Obtener el número administrador de la sesión activa
-    const myPhone = (this.socket?.user?.id?.split(':')[0] || '').replace(/[^\d]/g, '');
-
-    // Ignorar si el registro corresponde al propio número (evita auto-registro)
-    if (rawPhone === myPhone) return;
-
-    // Ignorar paquetes de sincronización técnica y estado interno de Meta
-    if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) return;
-
-    // Extraer texto del mensaje
     const textBody =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -331,61 +330,32 @@ class WhatsAppOnDemandService {
       msg.message.videoMessage?.caption ||
       '[Multimedia / Archivo adjunto]';
 
-    const pushName = msg.pushName || `+${rawPhone}`;
+    const pushName = msg.pushName || `+${finalPhone}`;
     const timestamp = msg.messageTimestamp
       ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
       : new Date().toISOString();
 
     try {
-      const supabase = getSupabase();
-      if (!supabase) {
-        console.error('❌ Error de Supabase: Cliente no configurado');
-        return;
-      }
-
-      // 1. Verificar si el contacto ya existe para proteger nombres editados por el usuario
-      const { data: existingContact } = await supabase
-        .from('wa_contacts')
-        .select('id, name')
-        .eq('phone', rawPhone)
-        .single();
-
+      const { data: existingContact } = await supabase.from('wa_contacts').select('id').eq('phone', finalPhone).single();
       let contactId: string;
 
       if (existingContact) {
         contactId = existingContact.id;
-        // Solo actualiza la fecha y el LID, protege el nombre existente
-        const updatePayload: Record<string, any> = { last_message_at: timestamp };
-        if (lidToSave) updatePayload.lid = lidToSave;
-
-        await supabase
-          .from('wa_contacts')
-          .update(updatePayload)
-          .eq('id', contactId);
+        // Solo inyectamos el LID si existe, sin borrarlo si ya estaba
+        const updateData: any = { last_message_at: timestamp };
+        if (lidToSave) updateData.lid = lidToSave;
+        await supabase.from('wa_contacts').update(updateData).eq('id', contactId);
       } else {
-        // Inserta el nuevo contacto con el pushName inicial y el LID
-        const insertPayload: Record<string, any> = {
-          phone: rawPhone,
-          name: pushName,
-          last_message_at: timestamp
-        };
-        if (lidToSave) insertPayload.lid = lidToSave;
-
-        const { data: newContact, error: insertError } = await supabase
+        const { data: newContact } = await supabase
           .from('wa_contacts')
-          .insert([insertPayload])
+          .insert([{ phone: finalPhone, name: pushName, last_message_at: timestamp, lid: lidToSave }])
           .select('id')
           .single();
-
-        if (insertError || !newContact) {
-          console.error('❌ Error insertando contacto:', insertError);
-          return;
-        }
+        if (!newContact) return;
         contactId = newContact.id;
       }
 
-      // 2. Inserción del mensaje usando el contactId protegido
-      const { error: msgError } = await supabase.from('wa_messages').insert([
+      await supabase.from('wa_messages').insert([
         {
           contact_id: contactId,
           message_body: textBody,
@@ -395,14 +365,8 @@ class WhatsAppOnDemandService {
           status: isOutbound ? 'sent' : 'delivered'
         }
       ]);
-
-      if (msgError) {
-        console.error('❌ Error guardando mensaje en Supabase:', msgError);
-      } else {
-        console.log(`✅ Mensaje guardado en Supabase para +${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
-      }
     } catch (err) {
-      console.error('❌ Error de Supabase (Excepción):', err);
+      console.error('[WhatsApp On-Demand] Error al persistir:', err);
     }
   }
 
@@ -412,7 +376,7 @@ class WhatsAppOnDemandService {
         fs.rmSync(this.authDir, { recursive: true, force: true });
       }
     } catch {
-      // Ignorar excepciones al vaciar la carpeta
+      // Silencioso
     }
   }
 }
