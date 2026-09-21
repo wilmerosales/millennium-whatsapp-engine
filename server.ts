@@ -15,7 +15,7 @@ import fs from 'fs';
 import pino from 'pino';
 
 // ============================================================================
-// 1. MANEJO GLOBAL DE ERRORES (PREVENIR CAÍDAS POR OOM O SOCKET ERRORS)
+// 1. MANEJO GLOBAL DE ERRORES (PREVENIR CIERRE ABRUPTO DEL SERVIDOR)
 // ============================================================================
 process.on('uncaughtException', (err) => {
   console.error('[CRITICAL - Uncaught Exception]:', err?.message || err);
@@ -57,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (OPTIMIZADA PARA BAJO CONSUMO DE RAM)
+// 3. CLASE WHATSAPP ON-DEMAND (OPTIMIZADA)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -96,26 +96,22 @@ class WhatsAppOnDemandService {
         version = fetchedVersion.version;
       }
     } catch {
-      // Usar versión fallback
+      // Usar versión por defecto
     }
 
-    // CONFIGURACIÓN ULTRA LIGERA DE BAILEYS (ANTI-OOM)
+    // Configuración ligera y segura contra picos de memoria
     this.socket = makeWASocket({
       version,
       auth: state,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: ['Millennium Academy Admin', 'Chrome', '122.0.0.0'],
-      
-      // CRÍTICO: Desactivar sincronización de historial viejo para no agotar la RAM
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: false,
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
-      
-      // No almacenar en memoria mensajes pesados anteriores
       getMessage: async () => undefined
     });
 
@@ -149,7 +145,7 @@ class WhatsAppOnDemandService {
           this.connectedPhone = null;
 
           if (isLoggedOut) {
-            console.log('[WhatsApp On-Demand] Sesión desvinculada por el usuario.');
+            console.log('[WhatsApp On-Demand] Sesión desvinculada.');
             this.clearSessionFolder();
           }
         }
@@ -158,11 +154,10 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // Procesar solo mensajes nuevos entrantes y salientes
+    // 1 & 2: Procesar todos los mensajes y registrar logs de detección
     this.socket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify' && type !== 'append') return;
-
       for (const msg of messages) {
+        console.log('📬 Mensaje detectado de:', msg.key.remoteJid, 'Tipo:', type);
         try {
           await this.persistMessageToSupabase(msg);
         } catch (msgErr) {
@@ -203,6 +198,7 @@ class WhatsAppOnDemandService {
     return { success: true };
   }
 
+  // 3: Persistencia estricta en Supabase con captura de errores completa
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
@@ -226,9 +222,12 @@ class WhatsAppOnDemandService {
 
     try {
       const supabase = getSupabase();
-      if (!supabase) return;
+      if (!supabase) {
+        console.error('❌ Error de Supabase: Cliente Supabase no inicializado (revisa variables de entorno)');
+        return;
+      }
 
-      // 1. Upsert en wa_contacts
+      // 1. Upsert del contacto
       const { data: contactData, error: contactError } = await supabase
         .from('wa_contacts')
         .upsert(
@@ -243,11 +242,11 @@ class WhatsAppOnDemandService {
         .single();
 
       if (contactError || !contactData?.id) {
-        console.error('[WhatsApp On-Demand] Error en upsert de contacto:', contactError);
+        console.error('❌ Error de Supabase:', contactError || 'No se obtuvo el ID del contacto tras el upsert');
         return;
       }
 
-      // 2. Inserción en wa_messages
+      // 2. Inserción del mensaje
       const { error: msgError } = await supabase.from('wa_messages').insert([
         {
           contact_id: contactData.id,
@@ -260,10 +259,12 @@ class WhatsAppOnDemandService {
       ]);
 
       if (msgError) {
-        console.error('[WhatsApp On-Demand] Error guardando mensaje:', msgError);
+        console.error('❌ Error de Supabase:', msgError);
+      } else {
+        console.log(`✅ Mensaje guardado en Supabase para +${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
       }
     } catch (err) {
-      console.error('[WhatsApp On-Demand] Excepción guardando historial en Supabase:', err);
+      console.error('❌ Error de Supabase (Excepción):', err);
     }
   }
 
@@ -281,12 +282,11 @@ class WhatsAppOnDemandService {
 const whatsAppOnDemand = new WhatsAppOnDemandService();
 
 // ============================================================================
-// 4. EXPRESS SERVER SETUP (CONFIGURACIÓN PERMISIVA DE CORS)
+// 4. EXPRESS SERVER & CORS PERMISIVO
 // ============================================================================
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Configuración CORS estricta y preflight antes de las rutas
 app.use(
   cors({
     origin: '*',
@@ -296,7 +296,6 @@ app.use(
   })
 );
 
-// Fallback explícito de cabeceras CORS
 app.use((req: Request, res: Response, next: NextFunction) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -309,13 +308,12 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json());
 
-// Health check para el monitor de Render
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', uptime: process.uptime(), memory: process.memoryUsage() });
+  res.json({ status: 'ok', uptime: process.uptime() });
 });
 
 // ============================================================================
-// 5. RUTAS API ON-DEMAND
+// 5. RUTAS DE LA API
 // ============================================================================
 app.get('/api/whatsapp/on-demand/status', (_req: Request, res: Response) => {
   res.json(whatsAppOnDemand.getStatus());
