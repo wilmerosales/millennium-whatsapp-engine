@@ -15,7 +15,7 @@ import fs from 'fs';
 import pino from 'pino';
 
 // ============================================================================
-// 1. MANEJO GLOBAL DE ERRORES (PREVENIR CIERRE ABRUPTO DEL SERVIDOR)
+// 1. MANEJO GLOBAL DE ERRORES (PREVENIR CIERRE ABRUPTO DEL PROCESO)
 // ============================================================================
 process.on('uncaughtException', (err) => {
   console.error('[CRITICAL - Uncaught Exception]:', err?.message || err);
@@ -26,7 +26,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // ============================================================================
-// 2. SUPABASE CLIENT CONFIGURATION (LAZY INITIALIZATION)
+// 2. CONFIGURACIÓN DEL CLIENTE SUPABASE (INICIALIZACIÓN DIFERIDA)
 // ============================================================================
 let supabaseInstance: SupabaseClient | null = null;
 
@@ -57,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (OPTIMIZADA)
+// 3. CLASE WHATSAPP ON-DEMAND (ANTI-SOCKETS FANTASMAS Y RECONEXIÓN SILENCIOSA)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -80,7 +80,22 @@ class WhatsAppOnDemandService {
       return { qrCodeDataUrl: null, state: 'connected' };
     }
 
-    this.connectionState = 'connecting';
+    // 1. Limpieza preventiva: destruir socket previo y sus listeners para evitar sockets fantasmas
+    if (this.socket) {
+      try {
+        this.socket.ev.removeAllListeners('connection.update');
+        this.socket.ev.removeAllListeners('creds.update');
+        this.socket.ev.removeAllListeners('messages.upsert');
+        this.socket.end(undefined);
+      } catch (cleanErr) {
+        console.warn('[WhatsApp] Advertencia al destruir socket previo:', cleanErr);
+      }
+      this.socket = null;
+    }
+
+    if (this.connectionState !== 'connected') {
+      this.connectionState = 'connecting';
+    }
     this.qrCodeDataUrl = null;
 
     if (!fs.existsSync(this.authDir)) {
@@ -96,10 +111,9 @@ class WhatsAppOnDemandService {
         version = fetchedVersion.version;
       }
     } catch {
-      // Usar versión por defecto
+      // Fallback
     }
 
-    // Configuración ligera y segura contra picos de memoria
     this.socket = makeWASocket({
       version,
       auth: state,
@@ -137,16 +151,27 @@ class WhatsAppOnDemandService {
           console.log(`[WhatsApp On-Demand] Conectado exitosamente con: ${this.connectedPhone}`);
         }
 
+        // 2. Auto-Reconexión Silenciosa sin expulsar al usuario
         if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-          const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-          this.connectionState = 'disconnected';
-          this.qrCodeDataUrl = null;
-          this.connectedPhone = null;
+          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-          if (isLoggedOut) {
-            console.log('[WhatsApp On-Demand] Sesión desvinculada.');
+          if (shouldReconnect) {
+            console.log('[WhatsApp] Micro-corte detectado. Reconectando silenciosamente...');
+            // No cambiamos this.connectionState a 'disconnected' para no colapsar la UI
+            this.startSession();
+          } else {
+            console.log('[WhatsApp] Sesión cerrada permanentemente o desvinculada.');
+            this.connectionState = 'disconnected';
+            this.qrCodeDataUrl = null;
+            this.connectedPhone = null;
             this.clearSessionFolder();
+            if (this.socket) {
+              try {
+                this.socket.end(undefined);
+              } catch {}
+              this.socket = null;
+            }
           }
         }
       } catch (connErr) {
@@ -154,7 +179,6 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 1 & 2: Procesar todos los mensajes y registrar logs de detección
     this.socket.ev.on('messages.upsert', async ({ messages, type }) => {
       for (const msg of messages) {
         console.log('📬 Mensaje detectado de:', msg.key.remoteJid, 'Tipo:', type);
@@ -189,7 +213,7 @@ class WhatsAppOnDemandService {
         this.socket = null;
       }
     } catch {
-      // Ignorar si el socket ya estaba cerrado
+      // Socket ya cerrado
     }
     this.connectionState = 'disconnected';
     this.qrCodeDataUrl = null;
@@ -198,7 +222,6 @@ class WhatsAppOnDemandService {
     return { success: true };
   }
 
-  // 3: Persistencia estricta en Supabase con captura de errores completa
   private async persistMessageToSupabase(msg: proto.IWebMessageInfo) {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
@@ -223,7 +246,7 @@ class WhatsAppOnDemandService {
     try {
       const supabase = getSupabase();
       if (!supabase) {
-        console.error('❌ Error de Supabase: Cliente Supabase no inicializado (revisa variables de entorno)');
+        console.error('❌ Error de Supabase: Cliente no configurado');
         return;
       }
 
@@ -242,7 +265,7 @@ class WhatsAppOnDemandService {
         .single();
 
       if (contactError || !contactData?.id) {
-        console.error('❌ Error de Supabase:', contactError || 'No se obtuvo el ID del contacto tras el upsert');
+        console.error('❌ Error de Supabase (Contacto):', contactError || 'No se obtuvo ID');
         return;
       }
 
@@ -259,7 +282,7 @@ class WhatsAppOnDemandService {
       ]);
 
       if (msgError) {
-        console.error('❌ Error de Supabase:', msgError);
+        console.error('❌ Error de Supabase (Mensaje):', msgError);
       } else {
         console.log(`✅ Mensaje guardado en Supabase para +${rawPhone} (${isOutbound ? 'Saliente' : 'Entrante'})`);
       }
@@ -274,7 +297,7 @@ class WhatsAppOnDemandService {
         fs.rmSync(this.authDir, { recursive: true, force: true });
       }
     } catch {
-      // Ignorar excepciones al vaciar la carpeta temporal
+      // Ignorar excepciones al vaciar la carpeta
     }
   }
 }
@@ -282,7 +305,7 @@ class WhatsAppOnDemandService {
 const whatsAppOnDemand = new WhatsAppOnDemandService();
 
 // ============================================================================
-// 4. EXPRESS SERVER & CORS PERMISIVO
+// 4. EXPRESS SERVER SETUP
 // ============================================================================
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -313,7 +336,7 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 // ============================================================================
-// 5. RUTAS DE LA API
+// 5. RUTAS API
 // ============================================================================
 app.get('/api/whatsapp/on-demand/status', (_req: Request, res: Response) => {
   res.json(whatsAppOnDemand.getStatus());
