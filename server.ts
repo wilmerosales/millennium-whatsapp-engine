@@ -56,8 +56,23 @@ function getSupabase(): SupabaseClient | null {
   }
 }
 
+// Comprobación preventiva de la columna "lid" en wa_contacts
+(async () => {
+  try {
+    const supabase = getSupabase();
+    if (supabase) {
+      const check = await supabase.from('wa_contacts').select('lid').limit(1);
+      if (check && (check as any).error) {
+        console.warn('[WhatsApp] AVISO: Asegúrate de tener la columna "lid" (texto, nullable) en la tabla wa_contacts de Supabase.');
+      }
+    }
+  } catch {
+    // Silencioso
+  }
+})();
+
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (EXTRACCIÓN DEFINITIVA SENDER_PN)
+// 3. CLASE WHATSAPP ON-DEMAND (TRADUCCIÓN BIDIRECCIONAL DE LIDs)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -192,13 +207,29 @@ class WhatsAppOnDemandService {
     return { qrCodeDataUrl: this.qrCodeDataUrl, state: this.connectionState };
   }
 
+  // Traducción de salida: si el contacto se registró con LID, envía usando dicho LID
   public async sendMessage(toPhone: string, text: string) {
     if (!this.socket || this.connectionState !== 'connected') {
       throw new Error('No hay una sesión activa de WhatsApp');
     }
 
-    const jid = toPhone.includes('@') ? toPhone : `${toPhone.replace(/[^\d]/g, '')}@s.whatsapp.net`;
-    const sent = await this.socket.sendMessage(jid, { text });
+    const cleanPhone = toPhone.replace(/[^\d]/g, '');
+    let targetJid = `${cleanPhone}@s.whatsapp.net`;
+
+    const supabase = getSupabase();
+    if (supabase) {
+      try {
+        const { data } = await supabase.from('wa_contacts').select('lid').eq('phone', cleanPhone).single();
+        if (data && (data as any).lid) {
+          targetJid = (data as any).lid;
+          console.log(`[WhatsApp] Traduciendo salida a LID: ${targetJid}`);
+        }
+      } catch (lidErr) {
+        console.warn('[WhatsApp] Advertencia al consultar LID para envío:', lidErr);
+      }
+    }
+
+    const sent = await this.socket.sendMessage(targetJid, { text });
     return sent;
   }
 
@@ -226,9 +257,11 @@ class WhatsAppOnDemandService {
 
     // 1. Obtener el JID inicial
     let rawPhone = msg.key.remoteJid || '';
+    let lidToSave: string | null = null;
 
-    // 2. Si Meta ocultó el número usando un @lid, extraemos el número real desde senderPn
+    // 2. Si Meta ocultó el número usando un @lid, extraemos el número real desde senderPn y guardamos el LID
     if (rawPhone.includes('@lid')) {
+      lidToSave = rawPhone;
       // @ts-ignore - Baileys a veces no tipa senderPn en versiones antiguas
       const realPhone = (msg.key as any).senderPn;
       if (realPhone && realPhone.includes('@s.whatsapp.net')) {
@@ -287,16 +320,26 @@ class WhatsAppOnDemandService {
 
       if (existingContact) {
         contactId = existingContact.id;
-        // Solo actualiza la fecha, protege el nombre existente
+        // Solo actualiza la fecha y el LID, protege el nombre existente
+        const updatePayload: Record<string, any> = { last_message_at: timestamp };
+        if (lidToSave) updatePayload.lid = lidToSave;
+
         await supabase
           .from('wa_contacts')
-          .update({ last_message_at: timestamp })
+          .update(updatePayload)
           .eq('id', contactId);
       } else {
-        // Inserta el nuevo contacto con el pushName inicial
+        // Inserta el nuevo contacto con el pushName inicial y el LID
+        const insertPayload: Record<string, any> = {
+          phone: rawPhone,
+          name: pushName,
+          last_message_at: timestamp
+        };
+        if (lidToSave) insertPayload.lid = lidToSave;
+
         const { data: newContact, error: insertError } = await supabase
           .from('wa_contacts')
-          .insert([{ phone: rawPhone, name: pushName, last_message_at: timestamp }])
+          .insert([insertPayload])
           .select('id')
           .single();
 
