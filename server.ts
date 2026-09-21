@@ -1,12 +1,13 @@
 import 'dotenv/config';
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   WASocket,
-  proto
+  proto,
+  fetchLatestBaileysVersion
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import path from 'path';
@@ -14,7 +15,18 @@ import fs from 'fs';
 import pino from 'pino';
 
 // ============================================================================
-// SUPABASE CLIENT CONFIGURATION
+// 1. MANEJO GLOBAL DE ERRORES (PREVENIR CAÍDAS POR OOM O SOCKET ERRORS)
+// ============================================================================
+process.on('uncaughtException', (err) => {
+  console.error('[CRITICAL - Uncaught Exception]:', err?.message || err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[CRITICAL - Unhandled Rejection at]:', promise, 'reason:', reason);
+});
+
+// ============================================================================
+// 2. SUPABASE CLIENT CONFIGURATION (LAZY INITIALIZATION)
 // ============================================================================
 let supabaseInstance: SupabaseClient | null = null;
 
@@ -29,12 +41,14 @@ function getSupabase(): SupabaseClient | null {
     '';
 
   if (!supabaseUrl || !supabaseKey) {
-    console.warn('[Supabase] Credenciales no detectadas (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).');
+    console.warn('[Supabase] Credenciales no configuradas (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).');
     return null;
   }
 
   try {
-    supabaseInstance = createClient(supabaseUrl, supabaseKey);
+    supabaseInstance = createClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false }
+    });
     return supabaseInstance;
   } catch (err) {
     console.error('[Supabase] Error al inicializar cliente:', err);
@@ -43,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// WHATSAPP ON-DEMAND SERVICE CLASS
+// 3. CLASE WHATSAPP ON-DEMAND (OPTIMIZADA PARA BAJO CONSUMO DE RAM)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -75,53 +89,85 @@ class WhatsAppOnDemandService {
 
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
 
+    let version: [number, number, number] = [2, 3000, 1015901307];
+    try {
+      const fetchedVersion = await fetchLatestBaileysVersion();
+      if (fetchedVersion?.version) {
+        version = fetchedVersion.version;
+      }
+    } catch {
+      // Usar versión fallback
+    }
+
+    // CONFIGURACIÓN ULTRA LIGERA DE BAILEYS (ANTI-OOM)
     this.socket = makeWASocket({
+      version,
       auth: state,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: ['Millennium Academy Admin', 'Chrome', '122.0.0.0']
+      browser: ['Millennium Academy Admin', 'Chrome', '122.0.0.0'],
+      
+      // CRÍTICO: Desactivar sincronización de historial viejo para no agotar la RAM
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: false,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      
+      // No almacenar en memoria mensajes pesados anteriores
+      getMessage: async () => undefined
     });
 
     this.socket.ev.on('creds.update', saveCreds);
 
     this.socket.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      try {
+        const { connection, lastDisconnect, qr } = update;
 
-      if (qr) {
-        this.connectionState = 'awaiting_scan';
-        try {
-          this.qrCodeDataUrl = await QRCode.toDataURL(qr);
-        } catch (qrErr) {
-          console.error('[WhatsApp On-Demand] Error al generar código QR en base64:', qrErr);
+        if (qr) {
+          this.connectionState = 'awaiting_scan';
+          try {
+            this.qrCodeDataUrl = await QRCode.toDataURL(qr);
+          } catch (qrErr) {
+            console.error('[WhatsApp On-Demand] Error al generar QR base64:', qrErr);
+          }
         }
-      }
 
-      if (connection === 'open') {
-        this.connectionState = 'connected';
-        this.qrCodeDataUrl = null;
-        this.connectedPhone = this.socket?.user?.id?.split(':')[0] || null;
-        console.log(`[WhatsApp On-Demand] Conectado exitosamente con el teléfono: ${this.connectedPhone}`);
-      }
-
-      if (connection === 'close') {
-        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        this.connectionState = 'disconnected';
-        this.qrCodeDataUrl = null;
-        this.connectedPhone = null;
-
-        if (isLoggedOut) {
-          console.log('[WhatsApp On-Demand] Sesión cerrada permanentemente o desvinculada.');
-          this.clearSessionFolder();
+        if (connection === 'open') {
+          this.connectionState = 'connected';
+          this.qrCodeDataUrl = null;
+          this.connectedPhone = this.socket?.user?.id?.split(':')[0] || null;
+          console.log(`[WhatsApp On-Demand] Conectado exitosamente con: ${this.connectedPhone}`);
         }
+
+        if (connection === 'close') {
+          const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+          const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+          this.connectionState = 'disconnected';
+          this.qrCodeDataUrl = null;
+          this.connectedPhone = null;
+
+          if (isLoggedOut) {
+            console.log('[WhatsApp On-Demand] Sesión desvinculada por el usuario.');
+            this.clearSessionFolder();
+          }
+        }
+      } catch (connErr) {
+        console.error('[WhatsApp On-Demand] Error en connection.update:', connErr);
       }
     });
 
+    // Procesar solo mensajes nuevos entrantes y salientes
     this.socket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return;
 
       for (const msg of messages) {
-        await this.persistMessageToSupabase(msg);
+        try {
+          await this.persistMessageToSupabase(msg);
+        } catch (msgErr) {
+          console.error('[WhatsApp On-Demand] Error procesando mensaje:', msgErr);
+        }
       }
     });
 
@@ -197,7 +243,7 @@ class WhatsAppOnDemandService {
         .single();
 
       if (contactError || !contactData?.id) {
-        console.error('[WhatsApp On-Demand] Error al hacer upsert de contacto:', contactError);
+        console.error('[WhatsApp On-Demand] Error en upsert de contacto:', contactError);
         return;
       }
 
@@ -214,7 +260,7 @@ class WhatsAppOnDemandService {
       ]);
 
       if (msgError) {
-        console.error('[WhatsApp On-Demand] Error al guardar mensaje en Supabase:', msgError);
+        console.error('[WhatsApp On-Demand] Error guardando mensaje:', msgError);
       }
     } catch (err) {
       console.error('[WhatsApp On-Demand] Excepción guardando historial en Supabase:', err);
@@ -235,20 +281,42 @@ class WhatsAppOnDemandService {
 const whatsAppOnDemand = new WhatsAppOnDemandService();
 
 // ============================================================================
-// EXPRESS SERVER SETUP
+// 4. EXPRESS SERVER SETUP (CONFIGURACIÓN PERMISIVA DE CORS)
 // ============================================================================
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+// Configuración CORS estricta y preflight antes de las rutas
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+    credentials: false
+  })
+);
 
-// Health check para monitoreo en Render
-app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+// Fallback explícito de cabeceras CORS
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
 });
 
-// Endpoints WhatsApp On-Demand
+app.use(express.json());
+
+// Health check para el monitor de Render
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({ status: 'ok', uptime: process.uptime(), memory: process.memoryUsage() });
+});
+
+// ============================================================================
+// 5. RUTAS API ON-DEMAND
+// ============================================================================
 app.get('/api/whatsapp/on-demand/status', (_req: Request, res: Response) => {
   res.json(whatsAppOnDemand.getStatus());
 });
@@ -288,5 +356,5 @@ app.post('/api/whatsapp/on-demand/send', async (req: Request, res: Response) => 
 });
 
 app.listen(PORT, () => {
-  console.log(`[WhatsApp Microservice] Servidor corriendo en el puerto ${PORT}`);
+  console.log(`[WhatsApp Microservice] Servidor escuchando en el puerto ${PORT}`);
 });
