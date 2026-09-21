@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (MAPEO EXACTO DE ESTADOS DE BAILEYS)
+// 3. CLASE WHATSAPP ON-DEMAND (ROBUSTEZ EN ACUSES Y PREVENCIÓN DE RETROCESOS)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -207,37 +207,38 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // 2. Listener de Actualización de Mensajes (Status numérico)
+    // 2. Listener de Actualización de Mensajes (Soporta números y strings)
     this.socket.ev.on('messages.update', async (updates) => {
       const supabase = getSupabase();
       if (!supabase) return;
 
       for (const update of updates) {
-        if (update.key && update.key.fromMe && update.update && typeof update.update.status === 'number') {
+        if (update.key && update.key.fromMe && update.update && update.update.status !== undefined) {
           const externalId = update.key.id;
-          const statusNum = update.update.status;
+          const statusVal = update.update.status as any;
 
           let statusText: string | null = null;
-          // Mapeo actual de Baileys: 2=SERVER_ACK, 3=DELIVERY_ACK, 4=READ, 5=PLAYED
-          if (statusNum === 2) statusText = 'sent';
-          if (statusNum === 3) statusText = 'delivered';
-          if (statusNum === 4 || statusNum === 5) statusText = 'read';
+          if (statusVal === 2 || statusVal === 'SERVER_ACK') statusText = 'sent';
+          if (statusVal === 3 || statusVal === 'DELIVERY_ACK') statusText = 'delivered';
+          if (statusVal === 4 || statusVal === 'READ' || statusVal === 5 || statusVal === 'PLAYED') statusText = 'read';
 
           if (externalId && statusText) {
             try {
-              await supabase
-                .from('wa_messages')
-                .update({ status: statusText })
-                .eq('external_id', externalId);
-            } catch (e) {
-              console.error('[WhatsApp] Error actualizando estado de mensaje:', e);
-            }
+              // Jerarquía: No permitir que un estado retroceda
+              const { data } = await supabase.from('wa_messages').select('status').eq('external_id', externalId).single();
+              const currentStatus = data?.status;
+
+              if (currentStatus === 'read') continue;
+              if (currentStatus === 'delivered' && statusText === 'sent') continue;
+
+              await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
+            } catch (e) {}
           }
         }
       }
     });
 
-    // 3. Listener de Acuses de Recibo Nativos
+    // 3. Listener de Acuses de Recibo Nativos (Ignorando ruido multidispositivo)
     this.socket.ev.on('message-receipt.update', async (updates) => {
       const supabase = getSupabase();
       if (!supabase) return;
@@ -247,19 +248,21 @@ class WhatsAppOnDemandService {
           const externalId = receipt.key.id;
           const type = (receipt.receipt as any)?.receiptType;
 
-          let statusText = 'delivered'; // Asumimos entregado por defecto si llega recibo
+          // Ignorar los recibos internos entre tus propios dispositivos vinculados
+          if (type === 'sender') continue;
+
+          let statusText = 'delivered';
           if (type === 'read' || type === 'read-self' || type === 'played') {
             statusText = 'read';
           }
 
           try {
-            await supabase
-              .from('wa_messages')
-              .update({ status: statusText })
-              .eq('external_id', externalId);
-          } catch (e) {
-            console.error('[WhatsApp] Error en message-receipt.update:', e);
-          }
+            // Jerarquía: Si ya estaba leído, no lo volvemos a poner como entregado
+            const { data } = await supabase.from('wa_messages').select('status').eq('external_id', externalId).single();
+            if (data?.status === 'read') continue;
+
+            await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
+          } catch (e) {}
         }
       }
     });
