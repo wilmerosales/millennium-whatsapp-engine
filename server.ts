@@ -57,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (CON FILTRO DE AUTO-REGISTRO Y PAQUETES META)
+// 3. CLASE WHATSAPP ON-DEMAND (CON RESOLUCIÓN DE LIDs A NÚMEROS REALES)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -223,9 +223,19 @@ class WhatsAppOnDemandService {
     if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
     const isOutbound = Boolean(msg.key.fromMe);
-    const remoteJid = msg.key.remoteJid || '';
+    
+    // 1. Obtener el JID inicial
+    let rawPhone = msg.key.remoteJid || '';
 
-    let rawPhone = remoteJid;
+    // 2. Si Meta ocultó el número usando un @lid, extraemos el número real desde participant
+    if (rawPhone.includes('@lid')) {
+      const altJid = msg.key.participant || (msg as any).participant || '';
+      if (altJid.includes('@s.whatsapp.net')) {
+        rawPhone = altJid;
+      }
+    }
+
+    // 3. Limpiar el puerto de sesión del dispositivo si existe (ej. 504XXXX:2@s.whatsapp.net -> 504XXXX@s.whatsapp.net)
     if (rawPhone.includes(':')) {
       rawPhone = rawPhone.split(':')[0] + rawPhone.substring(rawPhone.indexOf('@'));
     }
