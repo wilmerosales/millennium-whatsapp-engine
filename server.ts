@@ -444,6 +444,15 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json());
 
+// ============================================================================
+// HEALTH CHECKS (UPTIMEROBOT & MONITORING)
+// ============================================================================
+
+// Health Check para UptimeRobot (evita el 404 al monitorear la raíz '/')
+app.get('/', (_req: Request, res: Response) => {
+  res.status(200).send('Millennium WhatsApp Engine is UP and RUNNING!');
+});
+
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
