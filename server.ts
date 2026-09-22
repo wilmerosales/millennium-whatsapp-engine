@@ -72,7 +72,7 @@ function getSupabase(): SupabaseClient | null {
 })();
 
 // ============================================================================
-// 3. CLASE WHATSAPP ON-DEMAND (JERARQUÍA DE ESTADOS Y .LIMIT(1) ANTI-DUPLICADOS)
+// 3. CLASE WHATSAPP ON-DEMAND (CON PROTECCIÓN CONTRA RACE CONDITIONS)
 // ============================================================================
 class WhatsAppOnDemandService {
   private socket: WASocket | null = null;
@@ -207,70 +207,60 @@ class WhatsAppOnDemandService {
       }
     });
 
-    // Sistema de jerarquía para evitar retrocesos en las plecas
+    // Sistema de jerarquía para evitar retrocesos
     const statusWeight: Record<string, number> = { sent: 1, delivered: 2, read: 3 };
 
-    // 2. Listener de Actualización de Mensajes (Sin retrocesos)
-    this.socket.ev.on('messages.update', async (updates) => {
+    // Función centralizada con Retry Logic para la Race Condition
+    const updateMessageStatus = async (externalId: string, statusText: string) => {
+      if (!externalId || !statusText) return;
       const supabase = getSupabase();
       if (!supabase) return;
 
+      const check = async () => supabase.from('wa_messages').select('status').eq('external_id', externalId).limit(1);
+      let res = await check();
+
+      // Si el mensaje aún no existe (INSERT en progreso), esperamos 1.5 segundos
+      if (!res.data || res.data.length === 0) {
+        await new Promise((r) => setTimeout(r, 1500));
+        res = await check();
+      }
+
+      if (res.data && res.data.length > 0) {
+        const currentStatus = res.data[0].status as string;
+        if (statusWeight[statusText] > (statusWeight[currentStatus] || 0)) {
+          await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
+        }
+      }
+    };
+
+    // 2. Listener de Actualización de Mensajes
+    this.socket.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         if (update.key && update.key.fromMe && update.update && update.update.status !== undefined) {
-          const externalId = update.key.id;
           const statusVal = update.update.status as any;
-
           let statusText: string | null = null;
           if (statusVal === 2 || statusVal === 'SERVER_ACK') statusText = 'sent';
           if (statusVal === 3 || statusVal === 'DELIVERY_ACK') statusText = 'delivered';
           if (statusVal === 4 || statusVal === 'READ' || statusVal === 5 || statusVal === 'PLAYED') statusText = 'read';
 
-          if (externalId && statusText) {
-            try {
-              // limit(1) evita el error de .single() si hay duplicados
-              const { data } = await supabase.from('wa_messages').select('status').eq('external_id', externalId).limit(1);
-              if (data && data.length > 0) {
-                const currentStatus = data[0].status;
-                // Si el peso del nuevo estado es menor o igual al actual, ignoramos (ej. no pasar de delivered a sent)
-                if (statusWeight[statusText] <= (statusWeight[currentStatus as string] || 0)) {
-                  continue;
-                }
-              }
-              await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
-            } catch (e) {
-              console.error('[WhatsApp] Error blindado en messages.update:', e);
-            }
+          if (statusText && update.key.id) {
+            await updateMessageStatus(update.key.id, statusText);
           }
         }
       }
     });
 
-    // 3. Listener de Acuses de Recibo Nativos (Con pesos jerárquicos)
+    // 3. Listener de Acuses de Recibo Nativos
     this.socket.ev.on('message-receipt.update', async (updates) => {
-      const supabase = getSupabase();
-      if (!supabase) return;
-
       for (const receipt of updates) {
         if (receipt.key && receipt.key.id && receipt.key.fromMe) {
-          const externalId = receipt.key.id;
           const type = (receipt.receipt as any)?.receiptType;
           if (type === 'sender') continue;
 
           let statusText = 'delivered';
           if (type === 'read' || type === 'read-self' || type === 'played') statusText = 'read';
 
-          try {
-            const { data } = await supabase.from('wa_messages').select('status').eq('external_id', externalId).limit(1);
-            if (data && data.length > 0) {
-              const currentStatus = data[0].status;
-              if (statusWeight[statusText] <= (statusWeight[currentStatus as string] || 0)) {
-                continue;
-              }
-            }
-            await supabase.from('wa_messages').update({ status: statusText }).eq('external_id', externalId);
-          } catch (e) {
-            console.error('[WhatsApp] Error blindado en receipt.update:', e);
-          }
+          await updateMessageStatus(receipt.key.id, statusText);
         }
       }
     });
@@ -392,6 +382,13 @@ class WhatsAppOnDemandService {
         contactId = newContact.id;
       }
 
+      let initialStatus = isOutbound ? 'sent' : 'delivered';
+      const msgStatus = msg.status as any;
+      if (isOutbound && msgStatus) {
+        if (msgStatus === 3 || msgStatus === 'DELIVERY_ACK') initialStatus = 'delivered';
+        if (msgStatus === 4 || msgStatus === 'READ' || msgStatus === 5 || msgStatus === 'PLAYED') initialStatus = 'read';
+      }
+
       await supabase.from('wa_messages').insert([
         {
           contact_id: contactId,
@@ -399,7 +396,7 @@ class WhatsAppOnDemandService {
           direction: isOutbound ? 'outbound' : 'inbound',
           timestamp: timestamp,
           external_id: msg.key.id || null,
-          status: isOutbound ? 'sent' : 'delivered'
+          status: initialStatus
         }
       ]);
     } catch (err) {
